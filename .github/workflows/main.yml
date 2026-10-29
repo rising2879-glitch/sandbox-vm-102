@@ -1,0 +1,100 @@
+name: Windows 
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+    - name: รัน RDP และ Serveo
+      shell: pwsh
+      run: |
+        $logWebhook = "https://discord.com/api/webhooks/1565086579679043690/PIBC3XG8hixnr3au6f9f5NiorTTiRs0fn1JS2ugWQLB7xbNdTu2oeCPoKzhAaUmvf9cH"
+        $infoWebhook = "https://discord.com/api/webhooks/1563946696231354380/UiQ5AOcmL4w763uZEgGgZ-kGypSD0fMAt6nvN1HfBzWcOyLx5Mg5m6Ja2UAkAfz6OvvR"
+
+        function Send-Log {
+            param([string]$message)
+            if ($logWebhook) {
+                $body = @{ content = $message } | ConvertTo-Json
+                try { 
+                    Invoke-RestMethod -Uri $logWebhook -Method Post -Body $body -ContentType 'application/json' 
+                } catch {}
+            }
+        }
+
+        try {
+            Send-Log "Starting minimal Windows RDP setup..."
+
+            # 1. ตั้งค่า RDP และสร้าง User
+            Send-Log "Enabling Remote Desktop and creating user..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+            secedit /export /cfg C:\secpol.cfg
+            (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content C:\secpol.cfg
+            secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+            net user Rising "12345678910yr" /add
+            net localgroup administrators Rising /add
+
+            Write-Host "=========================================="
+            Write-Host "Username: Rising"
+            Write-Host "Password: 12345678910yr"
+            Write-Host "=========================================="
+            Write-Host "กำลังเชื่อมต่อ Serveo..."
+            
+            # 2. ตั้งค่าการเชื่อมต่อ SSH Tunnel ไปยัง Serveo
+            $sshProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $sshProcessInfo.FileName = "ssh"
+            $sshProcessInfo.Arguments = "-o ServerAliveInterval=60 -o ServerAliveCountMax=10 -T -o StrictHostKeyChecking=no -R 0:localhost:3389 serveo.net"
+            $sshProcessInfo.RedirectStandardOutput = $true
+            $sshProcessInfo.RedirectStandardError = $true
+            $sshProcessInfo.UseShellExecute = $false
+            $sshProcessInfo.CreateNoWindow = $true
+
+            $sshProcess = New-Object System.Diagnostics.Process
+            $sshProcess.StartInfo = $sshProcessInfo
+            $null = $sshProcess.Start()
+
+            # วนลูปอ่าน Output เพื่อหา Port (รอไม่เกิน 20 วินาที)
+            $assignedPort = $null
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($sw.ElapsedMilliseconds -lt 20000) {
+                if ($sshProcess.StandardOutput.Peek() -ge 0) {
+                    $line = $sshProcess.StandardOutput.ReadLine()
+                    Write-Host $line
+                    if ($line -match "Forwarding TCP connections from .+?:(\d+)") {
+                        $assignedPort = $Matches[1]
+                        break
+                    }
+                }
+                Start-Sleep -Milliseconds 200
+            }
+
+            Send-Log "Setup completed successfully!"
+
+            if ($infoWebhook) {
+                if ($assignedPort) {
+                    $msg = "Windows RDP is ready!`nHost: serveo.net:$assignedPort`nUser: Rising`nPass: 12345678910yr"
+                } else {
+                    $msg = "Windows RDP is ready!`nHost: serveo.net (Port: Check GitHub Logs)`nUser: Rising`nPass: 12345678910yr"
+                }
+                $bodyInfo = @{ content = $msg } | ConvertTo-Json
+                Invoke-RestMethod -Uri $infoWebhook -Method Post -Body $bodyInfo -ContentType 'application/json'
+            }
+
+            # 3. วนลูปค้างระบบไว้และเชื่อมต่อใหม่อัตโนมัติ (Auto-reconnect loop) จนครบ 360 นาที
+            while ($true) {
+                if ($sshProcess.HasExited) {
+                    Write-Host "SSH disconnected. Reconnecting to Serveo..."
+                    $sshProcess.Start() | Out-Null
+                }
+                Start-Sleep -Seconds 30
+            }
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+            Send-Log "ERROR occurred: $errMsg"
+            throw $_
+        }
